@@ -16,16 +16,17 @@ import (
 )
 
 func SpawnProcessToRunTest(ctx context.Context, testName string, timeout time.Duration) *extensiontests.ExtensionTestResult {
-	// longerCtx is used to backstop the process, but leave termination up to us if possible to allow a double interrupt
-	longerCtx, longerCancel := context.WithTimeout(ctx, timeout+15*time.Minute)
-	defer longerCancel()
-	timeoutCtx, shorterCancel := context.WithTimeout(longerCtx, timeout)
-	defer shorterCancel()
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 
-	command := exec.CommandContext(longerCtx, os.Args[0], "run-test", "--output=json", fmt.Sprintf("--timeout=%s", timeout), testName)
+	command := exec.CommandContext(timeoutCtx, os.Args[0], "run-test", "--output=json", fmt.Sprintf("--timeout=%s", timeout), testName)
+	command.Cancel = func() error {
+		return command.Process.Signal(syscall.SIGINT)
+	}
+	command.WaitDelay = time.Minute
 	command.Stdout = stdout
 	command.Stderr = stderr
 
@@ -36,28 +37,11 @@ func SpawnProcessToRunTest(ctx context.Context, testName string, timeout time.Du
 		return newTestResult(testName, extensiontests.ResultFailed, start, time.Now(), stdout, stderr)
 	}
 
-	go func() {
-		// interrupt after timeout, or exit early if the process finishes first
-		select {
-		case <-time.After(timeout):
-		case <-timeoutCtx.Done():
-		}
-		if command.Process != nil {
-			_ = command.Process.Signal(syscall.SIGINT)
-		}
-		// Canceled means the process exited and the context was cancelled — no need to escalate
-		if timeoutCtx.Err() == context.Canceled {
-			return
-		}
-		// if the process is hung, send SIGABRT after a grace period for a stack dump
-		<-time.After(time.Minute)
-		if command.Process != nil {
-			_ = command.Process.Signal(syscall.SIGABRT)
-		}
-	}()
-
 	result := extensiontests.ResultFailed
 	cmdErr := command.Wait()
+	if errors.Is(cmdErr, exec.ErrWaitDelay) {
+		_ = command.Process.Signal(syscall.SIGABRT)
+	}
 
 	subcommandResult, parseErr := newTestResultFromOutput(stdout)
 	if parseErr == nil {
